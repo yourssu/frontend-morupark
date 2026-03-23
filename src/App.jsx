@@ -3,6 +3,8 @@ import yourshoLogo from "../logo.png";
 import { ApiError, enqueue, fetchQueueStatus, login } from "./api.js";
 
 const POLLING_INTERVAL = 3000;
+const LOST_REENQUEUE_DELAY_SECONDS = 3;
+const RESULT_REVEAL_DELAY_MS = 1400;
 const STORAGE_KEY = "morupark-queue-session";
 
 const eventMeta = {
@@ -74,6 +76,12 @@ function digitsOnly(value) {
   return value.replace(/\D/g, "");
 }
 
+function sleep(milliseconds) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, milliseconds);
+  });
+}
+
 function isRecoverableAuthError(error) {
   return error instanceof ApiError && error.status === 401;
 }
@@ -93,11 +101,18 @@ function App() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isReenqueuing, setIsReenqueuing] = useState(false);
+  const [reenqueueCountdown, setReenqueueCountdown] = useState(0);
+  const [failureReasonCode, setFailureReasonCode] = useState("");
   const [lastUpdatedAt, setLastUpdatedAt] = useState(null);
   const statusRequestSequence = useRef(0);
+  const reenqueueFlowSequence = useRef(0);
 
   const invalidateStatusResponse = () => {
     statusRequestSequence.current += 1;
+  };
+
+  const invalidateReenqueueFlow = () => {
+    reenqueueFlowSequence.current += 1;
   };
 
   const progressPercent = useMemo(() => {
@@ -131,6 +146,7 @@ function App() {
 
   const resetSession = () => {
     invalidateStatusResponse();
+    invalidateReenqueueFlow();
     setAccessToken("");
     setWaitingToken("");
     setQueueRank(0);
@@ -141,6 +157,8 @@ function App() {
     setIsRefreshing(false);
     setIsSubmitting(false);
     setIsReenqueuing(false);
+    setReenqueueCountdown(0);
+    setFailureReasonCode("");
     setPhase("login");
     clearStoredSession();
   };
@@ -151,16 +169,41 @@ function App() {
     }
 
     invalidateStatusResponse();
+    const flowSequence = reenqueueFlowSequence.current + 1;
+    reenqueueFlowSequence.current = flowSequence;
     setIsReenqueuing(true);
-    setStatusMessage("아쉽게 이번 회차는 놓쳤지만, 다음 회차 대기열에 자동 재진입 중입니다.");
-    setPhase("processing");
+    setFailureReasonCode("LOST");
+    setReenqueueCountdown(LOST_REENQUEUE_DELAY_SECONDS);
+    setPhase("failed");
 
     try {
+      for (let remainingSeconds = LOST_REENQUEUE_DELAY_SECONDS; remainingSeconds > 0; remainingSeconds -= 1) {
+        if (flowSequence !== reenqueueFlowSequence.current) {
+          return;
+        }
+
+        setReenqueueCountdown(remainingSeconds);
+        setStatusMessage(`아쉽게 이번 회차는 놓쳤어요. ${remainingSeconds}초 후 대기열에 다시 진입합니다.`);
+        await sleep(1000);
+      }
+
+      if (flowSequence !== reenqueueFlowSequence.current) {
+        return;
+      }
+
+      setPhase("processing");
+      setStatusMessage("다음 회차 대기열 입장권을 준비하고 있어요.");
+
       const enqueuePayload = await enqueue({ accessToken });
+      if (flowSequence !== reenqueueFlowSequence.current) {
+        return;
+      }
+
       setWaitingToken(enqueuePayload.waitingToken);
       setQueueRank(0);
       setEstimatedWaitSeconds(0);
       setInitialWaitSeconds(0);
+      setFailureReasonCode("");
       setStatusMessage("재도전 기회를 잡았어요! 새로운 번호표를 발급해 대기열 상태를 확인 중입니다.");
       setErrorMessage("");
       setPhase("processing");
@@ -171,7 +214,10 @@ function App() {
       setErrorMessage(error.message);
       setPhase("failed");
     } finally {
-      setIsReenqueuing(false);
+      if (flowSequence === reenqueueFlowSequence.current) {
+        setIsReenqueuing(false);
+        setReenqueueCountdown(0);
+      }
     }
   };
 
@@ -202,12 +248,24 @@ function App() {
     if (nextStatus === "SUCCESS") {
       invalidateStatusResponse();
       setWaitingToken("");
+      setFailureReasonCode("");
+      setStatusMessage("뽑기 결과를 확정하고 있어요.");
+      setPhase("processing");
+      await sleep(RESULT_REVEAL_DELAY_MS);
       setStatusMessage("축하합니다! 당첨이 확정되었습니다. 상품 수령 안내는 개별 연락드릴 예정입니다.");
       setPhase("success");
+      setLastUpdatedAt(new Date());
+      return;
     }
 
     if (nextStatus === "FAILED") {
       if (failureReason === "LOST") {
+        invalidateStatusResponse();
+        setWaitingToken("");
+        setFailureReasonCode("LOST");
+        setStatusMessage("뽑기 결과를 정리하고 있어요.");
+        setPhase("processing");
+        await sleep(RESULT_REVEAL_DELAY_MS);
         await recoverLostQueue();
         setLastUpdatedAt(new Date());
         return;
@@ -216,11 +274,13 @@ function App() {
       if (failureReason === "SOLD_OUT") {
         invalidateStatusResponse();
         setWaitingToken("");
+        setFailureReasonCode("SOLD_OUT");
         setStatusMessage("준비된 재고가 모두 소진되어 이벤트가 종료되었습니다.");
         setPhase("soldout");
       } else {
         invalidateStatusResponse();
         setWaitingToken("");
+        setFailureReasonCode(failureReason || "FAILED");
         setStatusMessage(payload?.message ?? "요청 처리에 실패했습니다. 다시 시도해주세요.");
         setPhase("failed");
       }
@@ -311,6 +371,8 @@ function App() {
       setStatusMessage("번호표가 발급되었습니다. 잠시 후 대기 상태를 불러옵니다.");
       setPhase("queue");
       setIsReenqueuing(false);
+      setReenqueueCountdown(0);
+      setFailureReasonCode("");
       setLastUpdatedAt(null);
     } catch (error) {
       setErrorMessage(error.message);
@@ -438,7 +500,11 @@ function App() {
             <div className="draw-orb draw-orb-delay2" />
           </div>
           <p className="draw-message">
-            {isReenqueuing ? "자격 정보는 유지하고 자동으로 다시 대기열에 입장하고 있어요!" : "행운을 섞는 중... 잠시만 기다려주세요!"}
+            {isReenqueuing
+              ? reenqueueCountdown > 0
+                ? `${reenqueueCountdown}초 후 대기열에 다시 진입합니다.`
+                : "자격 정보를 유지하고 자동으로 다시 대기열에 입장하고 있어요!"
+              : "행운을 섞는 중... 잠시만 기다려주세요!"}
           </p>
         </section>
       )}
@@ -479,13 +545,15 @@ function App() {
 
       {phase === "failed" && (
         <section className="card ended-card">
-          <div className="card-header">이벤트 안내</div>
-          <div className="ended-badge">실패</div>
-          <p className="ended-title">대기열 처리에 실패했습니다</p>
+          <div className="card-header">{failureReasonCode === "LOST" ? "뽑기 결과" : "이벤트 안내"}</div>
+          <div className="ended-badge">{failureReasonCode === "LOST" ? "미당첨" : "실패"}</div>
+          <p className="ended-title">
+            {failureReasonCode === "LOST" ? "아쉽게 이번 회차는 당첨되지 않았어요" : "대기열 처리에 실패했습니다"}
+          </p>
           <p className="ended-desc">{statusMessage}</p>
           <div className="actions result-actions">
             <button className="btn btn-primary" type="button" onClick={handleCancel}>
-              다시 시작
+              {failureReasonCode === "LOST" ? "그만하기" : "다시 시작"}
             </button>
           </div>
         </section>
